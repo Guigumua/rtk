@@ -17,7 +17,8 @@ use super::constants::{
     GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
     HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR,
     PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE,
-    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON, TRAE_DIR, TRAE_HOOKS_JSON,
+    TRAE_HOOK_COMMAND, TRAE_REWRITE_HOOK_FILE,
 };
 use super::integrity;
 
@@ -1757,6 +1758,317 @@ fn run_antigravity_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
     Ok(())
 }
 
+// ─── Trae support ──────────────────────────────────────────────
+
+pub fn run_trae_mode(ctx: InitContext) -> Result<()> {
+    run_trae_mode_at(&std::env::current_dir()?, ctx)
+}
+
+fn run_trae_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
+    let InitContext { verbose, dry_run } = ctx;
+    let trae_dir = base_dir.join(TRAE_DIR);
+
+    // 1. Write hook TypeScript script
+    let hooks_target = trae_dir.join(HOOKS_SUBDIR);
+    let hook_path = hooks_target.join(TRAE_REWRITE_HOOK_FILE);
+    let hook_script = include_str!("../../hooks/trae/rtk-rewrite.ts");
+
+    if dry_run {
+        println!("[dry-run] would write hook script: {}", hook_path.display());
+    } else {
+        fs::create_dir_all(&hooks_target)
+            .with_context(|| format!("Failed to create {}/hooks directory", TRAE_DIR))?;
+        write_if_changed(&hook_path, hook_script, "Trae hook script", ctx)?;
+    }
+
+    // 2. Write .trae/hooks.json with PreToolUse hook for RunCommand
+    let hooks_json_path = trae_dir.join(TRAE_HOOKS_JSON);
+    let hook_installed =
+        write_trae_hooks_json(&hooks_json_path, TRAE_HOOK_COMMAND, dry_run, verbose)?;
+
+    if dry_run {
+        print_dry_run_footer();
+    } else {
+        println!("\nRTK configured for Trae IDE.\n");
+        println!("  Hook:   {}/hooks/{}", TRAE_DIR, TRAE_REWRITE_HOOK_FILE);
+        if hook_installed {
+            println!(
+                "  Config: {}/{} (created/updated)",
+                TRAE_DIR, TRAE_HOOKS_JSON
+            );
+        }
+        println!("  Trae IDE will now auto-rewrite commands through rtk.");
+        println!("  Restart Trae IDE. Test with: git status\n");
+    }
+
+    Ok(())
+}
+
+/// Write .trae/hooks.json with the RTK PreToolUse hook.
+/// Uses Trae's versioned hooks.json schema with `"version": 1`.
+/// Merges with existing hooks if the file already exists.
+fn write_trae_hooks_json(
+    path: &Path,
+    hook_command: &str,
+    dry_run: bool,
+    verbose: u8,
+) -> Result<bool> {
+    let mut root: serde_json::Value = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({ "version": 1, "hooks": {} })
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
+        }
+    } else {
+        serde_json::json!({ "version": 1, "hooks": {} })
+    };
+
+    // Ensure version field and hooks object exist
+    let root_obj = root
+        .as_object_mut()
+        .context("hooks.json root is not an object")?;
+    if !root_obj.contains_key("version") {
+        root_obj.insert("version".to_string(), serde_json::json!(1));
+    }
+
+    let hooks = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("hooks value is not an object")?;
+
+    let pre_tool_use = hooks
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .context("PreToolUse value is not an array")?;
+
+    let already_present = pre_tool_use.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks_arr| {
+                hooks_arr.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c == hook_command)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if already_present {
+        if verbose > 0 {
+            eprintln!("{}/{}: RTK hook already present", TRAE_DIR, TRAE_HOOKS_JSON);
+        }
+        return Ok(false);
+    }
+
+    // Insert the RTK hook entry (Trae format: matcher "RunCommand")
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "RunCommand",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command,
+            "timeout": 30
+        }]
+    }));
+
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize hooks.json")?;
+
+    if dry_run {
+        println!(
+            "[dry-run] would write {}/{}: {}",
+            TRAE_DIR,
+            TRAE_HOOKS_JSON,
+            path.display()
+        );
+        if verbose > 0 {
+            println!("[dry-run] content:\n{}", serialized);
+        }
+        return Ok(true);
+    }
+
+    // Backup original
+    if path.exists() {
+        let backup_path = path.with_extension("json.bak");
+        fs::copy(path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    }
+
+    atomic_write(path, &serialized)?;
+    Ok(true)
+}
+
+pub fn uninstall_trae(ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let removed = uninstall_trae_at(&std::env::current_dir()?, ctx)?;
+
+    if removed.is_empty() {
+        println!("RTK Trae support was not installed (nothing to remove)");
+    } else {
+        let header = if dry_run {
+            "[dry-run] would uninstall RTK for Trae:"
+        } else {
+            "RTK uninstalled for Trae:"
+        };
+        println!("{}", header);
+        for item in &removed {
+            println!("  - {}", item);
+        }
+    }
+
+    if dry_run {
+        print_dry_run_footer();
+    }
+
+    Ok(())
+}
+
+fn uninstall_trae_at(base_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
+    let InitContext {
+        verbose: _,
+        dry_run,
+    } = ctx;
+    let mut removed = Vec::new();
+    let trae_dir = base_dir.join(TRAE_DIR);
+
+    // Remove hook TypeScript script
+    let hook_path = trae_dir.join(HOOKS_SUBDIR).join(TRAE_REWRITE_HOOK_FILE);
+    if hook_path.exists() {
+        if dry_run {
+            println!(
+                "[dry-run] would remove hook script: {}",
+                hook_path.display()
+            );
+        } else {
+            fs::remove_file(&hook_path)
+                .with_context(|| format!("Failed to remove hook: {}", hook_path.display()))?;
+        }
+        removed.push(format!("Hook: {}", hook_path.display()));
+    }
+
+    // Remove RTK entry from hooks.json
+    let hooks_json_path = trae_dir.join(TRAE_HOOKS_JSON);
+    if hooks_json_path.exists() {
+        let content = fs::read_to_string(&hooks_json_path)
+            .with_context(|| format!("Failed to read {}", hooks_json_path.display()))?;
+        if !content.trim().is_empty() {
+            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) {
+                if remove_trae_from_hooks_json(&mut root) {
+                    if dry_run {
+                        println!(
+                            "[dry-run] would remove RTK hook from {}",
+                            hooks_json_path.display()
+                        );
+                    } else {
+                        let serialized = serde_json::to_string_pretty(&root)
+                            .context("Failed to serialize hooks.json")?;
+                        atomic_write(&hooks_json_path, &serialized)?;
+                    }
+                    removed.push(format!(
+                        "Config: {}/{} (hook removed)",
+                        TRAE_DIR, TRAE_HOOKS_JSON
+                    ));
+                }
+            }
+        }
+    }
+
+    // Also clean up legacy settings.local.json patch if present
+    let legacy_settings = trae_dir.join("settings.local.json");
+    if legacy_settings.exists() {
+        let content = fs::read_to_string(&legacy_settings)
+            .with_context(|| format!("Failed to read {}", legacy_settings.display()))?;
+        if !content.trim().is_empty() {
+            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) {
+                let mut changed = false;
+                if let Some(hooks) = root.get_mut("hooks") {
+                    if let Some(ptu) = hooks.get_mut("PreToolUse") {
+                        if let Some(arr) = ptu.as_array_mut() {
+                            let orig = arr.len();
+                            arr.retain(|entry| {
+                                !entry
+                                    .get("hooks")
+                                    .and_then(|h| h.as_array())
+                                    .map(|hooks_arr| {
+                                        hooks_arr.iter().any(|h| {
+                                            h.get("command").and_then(|c| c.as_str()).is_some_and(
+                                                |c| {
+                                                    c == TRAE_HOOK_COMMAND
+                                                        || c.contains(REWRITE_HOOK_FILE)
+                                                },
+                                            )
+                                        })
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            changed = arr.len() < orig;
+                        }
+                    }
+                }
+                if changed {
+                    if dry_run {
+                        println!(
+                            "[dry-run] would remove legacy RTK hook from {}",
+                            legacy_settings.display()
+                        );
+                    } else {
+                        let serialized = serde_json::to_string_pretty(&root)
+                            .context("Failed to serialize settings.local.json")?;
+                        atomic_write(&legacy_settings, &serialized)?;
+                    }
+                    removed.push(format!(
+                        "Config: {}/settings.local.json (legacy hook removed)",
+                        TRAE_DIR
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Remove RTK hook entries from a Trae hooks.json.
+/// Returns true if any entries were removed.
+fn remove_trae_from_hooks_json(root: &mut serde_json::Value) -> bool {
+    let pre_tool_use_array = match root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut("PreToolUse"))
+        .and_then(|p| p.as_array_mut())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    let original_len = pre_tool_use_array.len();
+    pre_tool_use_array.retain(|entry| {
+        let is_rtk_hook = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|cmd| {
+                            cmd == TRAE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
+                        })
+                })
+            })
+            .unwrap_or(false);
+        !is_rtk_hook
+    });
+
+    pre_tool_use_array.len() < original_len
+}
 // ─── Hermes support ────────────────────────────────────────────
 
 const HERMES_PLUGIN_INIT: &str = include_str!("../../hooks/hermes/rtk-rewrite/__init__.py");

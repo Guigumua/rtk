@@ -507,6 +507,112 @@ fn cursor_allow(rewritten: &str) -> String {
     .to_string()
 }
 
+// ── Trae native hook ─────────────────────────────────────────
+
+/// Run the Trae IDE PreToolUse hook natively.
+///
+/// Trae IDE's PreToolUse JSON format (from `.trae/hooks.json`):
+///   stdin:  { "tool_name": "RunCommand", "tool_input": { "command": "git status" } }
+///   stdout: { "hookSpecificOutput": { "hookEventName": "PreToolUse",
+///             "permissionDecision": "allow",
+///             "updatedInput": { "command": "rtk git status" } } }
+///
+/// Note: `updatedInput` replaces the ENTIRE `tool_input` object,
+/// so we must preserve all original fields and only change `command`.
+pub fn run_trae() -> Result<()> {
+    let input = read_stdin_limited()?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    let v: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    // Extract tool_input.command
+    let tool_input = match v.get("tool_input") {
+        Some(ti) => ti,
+        None => return Ok(()),
+    };
+    let cmd = match tool_input.get("command").and_then(|c| c.as_str()) {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return Ok(()),
+    };
+
+    // Check if rewritable
+    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+        .unwrap_or_default();
+
+    use crate::discover::registry::rewrite_command;
+    let rewritten = match rewrite_command(&cmd, &excluded, &transparent_prefixes) {
+        Some(r) if r != cmd => r,
+        _ => return Ok(()),
+    };
+
+    // Build updated tool_input: clone all original fields, replace command
+    let mut updated_input = tool_input.clone();
+    if let Some(obj) = updated_input.as_object_mut() {
+        obj.insert(
+            "command".to_string(),
+            serde_json::Value::String(rewritten.clone()),
+        );
+    }
+
+    // Build Trae response
+    let response = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": format!("Rewritten to: {}", rewritten),
+            "updatedInput": updated_input
+        }
+    });
+
+    audit_log("rewrite", &cmd, &rewritten);
+    let _ = writeln!(io::stdout(), "{}", response);
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn run_trae_inner(input: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(input).ok()?;
+    let tool_input = v.get("tool_input")?;
+    let cmd = tool_input.get("command")?.as_str()?;
+    if cmd.is_empty() {
+        return None;
+    }
+    let (excluded, transparent_prefixes) = crate::core::config::Config::load()
+        .map(|c| (c.hooks.exclude_commands, c.hooks.transparent_prefixes))
+        .unwrap_or_default();
+    let rewritten =
+        crate::discover::registry::rewrite_command(cmd, &excluded, &transparent_prefixes)?;
+    if rewritten == cmd {
+        return None;
+    }
+    let mut updated_input = tool_input.clone();
+    if let Some(obj) = updated_input.as_object_mut() {
+        obj.insert(
+            "command".to_string(),
+            serde_json::Value::String(rewritten.clone()),
+        );
+    }
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": format!("Rewritten to: {}", rewritten),
+                "updatedInput": updated_input
+            }
+        })
+        .to_string(),
+    )
+}
+
 #[cfg(test)]
 fn run_cursor_inner(input: &str) -> String {
     run_cursor_inner_with_rules(input, &[], &[], &[])

@@ -49,6 +49,8 @@ pub enum AgentTarget {
     Pi,
     /// Hermes CLI
     Hermes,
+    /// Trae IDE
+    Trae,
 }
 
 #[derive(Parser)]
@@ -783,6 +785,8 @@ enum HookCommands {
     Gemini,
     /// Process Copilot preToolUse hook (VS Code + Copilot CLI, reads JSON from stdin)
     Copilot,
+    /// Process Trae IDE PreToolUse hook (reads JSON from stdin, CLI not yet supported)
+    Trae,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1846,6 +1850,8 @@ fn run_cli() -> Result<i32> {
                 } else {
                     hooks::init::uninstall_copilot(ctx)?;
                 }
+            } else if uninstall && agent == Some(AgentTarget::Trae) {
+                hooks::init::uninstall_trae(ctx)?;
             } else if uninstall {
                 uninstall_init_dispatch(
                     agent,
@@ -1885,6 +1891,11 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(ctx)?;
+            } else if agent == Some(AgentTarget::Trae) {
+                if global {
+                    anyhow::bail!("Trae is project-scoped. Use: rtk init --agent trae");
+                }
+                hooks::init::run_trae_mode(ctx)?;
             } else if agent == Some(AgentTarget::Hermes) {
                 hooks::init::run_hermes_mode(ctx)?;
             } else {
@@ -2220,6 +2231,10 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Copilot => {
                 hooks::hook_cmd::run_copilot()?;
+                0
+            }
+            HookCommands::Trae => {
+                hooks::hook_cmd::run_trae()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {
